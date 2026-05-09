@@ -4,10 +4,16 @@
 #include "esp_http_server.h"
 #include <HTTPClient.h>
 
-// =================== CONFIGURATION ===================
+// =====================================================
+//                   CONFIGURATION
+// =====================================================
 const char* PI_SERVER_URL = "http://192.168.4.2:5000/upload";
+const char* WIFI_SSID     = "ESP32-Camera";
+const char* WIFI_PASS     = "12345678";
 
-// =================== CAMERA PINS (Freenove ESP32-S3-WROOM) ===================
+// =====================================================
+//              CAMERA PINS - Freenove ESP32-S3-WROOM
+// =====================================================
 #define PWDN_GPIO_NUM  -1
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM  15
@@ -25,17 +31,24 @@ const char* PI_SERVER_URL = "http://192.168.4.2:5000/upload";
 #define HREF_GPIO_NUM  7
 #define PCLK_GPIO_NUM  13
 
-// Two separate HTTP server handles
-httpd_handle_t ui_httpd     = NULL;  // port 80  — web page + capture
-httpd_handle_t stream_httpd = NULL;  // port 81  — MJPEG stream
+// =====================================================
+//              HTTP SERVER HANDLES
+// =====================================================
+httpd_handle_t ui_httpd     = NULL;   // port 80 — web page + capture
+httpd_handle_t stream_httpd = NULL;   // port 81 — MJPEG stream
 
-// =================== WEB PAGE HTML ===================
-// Stream src points to port 81
+#define STREAM_BOUNDARY    "mjpegstream"
+#define STREAM_PART        "--mjpegstream\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n"
+
+// =====================================================
+//                   WEB PAGE HTML
+// =====================================================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML>
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Attendance Cam</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -45,9 +58,9 @@ const char index_html[] PROGMEM = R"rawliteral(
       font-family: Helvetica, Arial, sans-serif;
       padding: 20px;
     }
-    h2 { margin-bottom: 10px; font-size: 26px; letter-spacing: 1px; }
+    h2 { margin-bottom: 6px; font-size: 26px; letter-spacing: 1px; }
     .subtitle { color: #aaa; font-size: 13px; margin-bottom: 15px; }
-    img {
+    #video {
       width: 100%;
       max-width: 420px;
       transform: rotate(180deg);
@@ -55,6 +68,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       border-radius: 10px;
       display: block;
       margin: 0 auto;
+      background: #000;
+      min-height: 200px;
     }
     .btn {
       background-color: #007bff;
@@ -63,7 +78,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       padding: 18px 40px;
       font-size: 22px;
       font-weight: bold;
-      margin: 25px auto 10px auto;
+      margin: 20px auto 10px auto;
       cursor: pointer;
       border-radius: 50px;
       width: 80%;
@@ -72,26 +87,17 @@ const char index_html[] PROGMEM = R"rawliteral(
       box-shadow: 0 5px #0056b3;
       transition: all 0.1s;
     }
-    .btn:active {
-      background-color: #0056b3;
-      box-shadow: 0 0 #0056b3;
-      transform: translateY(4px);
-    }
-    .btn:disabled {
-      background-color: #555;
-      box-shadow: 0 5px #333;
-      cursor: not-allowed;
-    }
+    .btn:active  { background-color: #0056b3; box-shadow: none; transform: translateY(4px); }
+    .btn:disabled { background-color: #555; box-shadow: 0 5px #333; cursor: not-allowed; }
     #status {
-      font-size: 22px;
+      font-size: 20px;
       font-weight: bold;
-      margin-top: 15px;
-      min-height: 35px;
+      margin-top: 12px;
+      min-height: 32px;
       color: #00ff00;
-      padding: 5px;
     }
     #log {
-      margin: 15px auto;
+      margin: 12px auto;
       max-width: 420px;
       background: #111;
       border: 1px solid #333;
@@ -101,7 +107,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       color: #aaa;
       text-align: left;
       min-height: 60px;
-      max-height: 150px;
+      max-height: 140px;
       overflow-y: auto;
     }
   </style>
@@ -110,7 +116,8 @@ const char index_html[] PROGMEM = R"rawliteral(
   <h2>Attendance Cam</h2>
   <p class="subtitle">Freenove ESP32-S3-WROOM</p>
 
-  <img src="http://192.168.4.1:81/stream" id="video">
+  <img src="http://192.168.4.1:81/stream" id="video"
+       onerror="this.style.border='2px solid red'" >
 
   <p id="status">Ready</p>
 
@@ -120,70 +127,66 @@ const char index_html[] PROGMEM = R"rawliteral(
 
   <script>
     function addLog(msg) {
-      var log = document.getElementById("log");
-      var line = document.createElement("div");
-      line.textContent = new Date().toLocaleTimeString() + " -> " + msg;
-      log.appendChild(line);
+      var log = document.getElementById('log');
+      var d   = document.createElement('div');
+      d.textContent = new Date().toLocaleTimeString() + ' > ' + msg;
+      log.appendChild(d);
       log.scrollTop = log.scrollHeight;
     }
 
+    function setStatus(msg, color) {
+      var el = document.getElementById('status');
+      el.innerHTML   = msg;
+      el.style.color = color;
+    }
+
     function capture() {
-      var statusEl = document.getElementById("status");
-      var btn = document.getElementById("captureBtn");
-
-      statusEl.innerHTML = "Capturing...";
-      statusEl.style.color = "yellow";
+      var btn = document.getElementById('captureBtn');
+      setStatus('Capturing...', 'yellow');
       btn.disabled = true;
+      addLog('Capturing photo...');
 
-      addLog("Capturing photo...");
+      var xhr = new XMLHttpRequest();
+      xhr.timeout = 30000;
 
-      var xhttp = new XMLHttpRequest();
-
-      xhttp.onreadystatechange = function() {
-        if (this.readyState == 4) {
-          btn.disabled = false;
-          if (this.status == 200) {
-            var resp = this.responseText.trim();
-            statusEl.innerHTML = resp;
-            statusEl.style.color = "#00ff00";
-            addLog("Server: " + resp);
-          } else {
-            statusEl.innerHTML = "Error: " + this.responseText;
-            statusEl.style.color = "red";
-            addLog("Error: " + this.responseText);
-          }
-          setTimeout(function() {
-            statusEl.innerHTML = "Ready";
-            statusEl.style.color = "#00ff00";
-          }, 3000);
+      xhr.onreadystatechange = function() {
+        if (this.readyState !== 4) return;
+        btn.disabled = false;
+        if (this.status === 200) {
+          var r = this.responseText.trim();
+          setStatus(r, '#00ff00');
+          addLog('Pi: ' + r);
+        } else {
+          setStatus('Error: ' + this.responseText, 'red');
+          addLog('Error: ' + this.responseText);
         }
+        setTimeout(function(){ setStatus('Ready', '#00ff00'); }, 3000);
       };
 
-      xhttp.timeout = 30000;
-      xhttp.ontimeout = function() {
-        statusEl.innerHTML = "Timeout - Pi took too long";
-        statusEl.style.color = "red";
+      xhr.ontimeout = function() {
         btn.disabled = false;
-        addLog("Timeout after 30 seconds");
+        setStatus('Timeout - Pi took too long', 'red');
+        addLog('Timeout after 30s');
       };
 
-      xhttp.onerror = function() {
-        statusEl.innerHTML = "Connection Error";
-        statusEl.style.color = "red";
+      xhr.onerror = function() {
         btn.disabled = false;
-        addLog("Connection error");
+        setStatus('Connection Error', 'red');
+        addLog('Connection error');
       };
 
-      xhttp.open("GET", "/capture", true);
-      xhttp.send();
-      addLog("Sending to Pi server...");
+      xhr.open('GET', '/capture', true);
+      xhr.send();
+      addLog('Request sent to ESP32...');
     }
   </script>
 </body>
 </html>
 )rawliteral";
 
-// =================== HANDLERS ===================
+// =====================================================
+//                   HANDLERS
+// =====================================================
 
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
@@ -192,7 +195,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
 static esp_err_t capture_handler(httpd_req_t *req) {
   Serial.println("-----------------------------");
-  Serial.println("[ESP32] Capture triggered by browser");
+  Serial.println("[ESP32] Capture request received");
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
@@ -201,27 +204,27 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
-  Serial.printf("[ESP32] Photo captured: %u bytes (%.1f KB)\n", fb->len, fb->len / 1024.0);
-  Serial.printf("[ESP32] Sending to: %s\n", PI_SERVER_URL);
+  Serial.printf("[ESP32] Photo: %u bytes (%.1f KB)\n", fb->len, fb->len / 1024.0f);
+  Serial.printf("[ESP32] Sending to Pi: %s\n", PI_SERVER_URL);
 
   HTTPClient http;
   http.begin(PI_SERVER_URL);
   http.addHeader("Content-Type", "image/jpeg");
   http.setTimeout(30000);
 
-  int httpCode = http.POST(fb->buf, fb->len);
+  int code = http.POST(fb->buf, fb->len);
   esp_camera_fb_return(fb);
 
-  String responseMsg;
-  if (httpCode > 0) {
-    responseMsg = http.getString();
-    Serial.printf("[ESP32] Pi responded (%d): %s\n", httpCode, responseMsg.c_str());
-    httpd_resp_send(req, responseMsg.c_str(), HTTPD_RESP_USE_STRLEN);
+  String reply;
+  if (code > 0) {
+    reply = http.getString();
+    Serial.printf("[ESP32] Pi replied (%d): %s\n", code, reply.c_str());
+    httpd_resp_send(req, reply.c_str(), HTTPD_RESP_USE_STRLEN);
   } else {
-    responseMsg = "Send Failed: " + String(httpCode);
-    Serial.printf("[ESP32] ERROR: %s\n", responseMsg.c_str());
+    reply = "Send Failed: " + String(code);
+    Serial.printf("[ESP32] ERROR: %s\n", reply.c_str());
     httpd_resp_set_status(req, "500 Internal Server Error");
-    httpd_resp_send(req, responseMsg.c_str(), HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, reply.c_str(), HTTPD_RESP_USE_STRLEN);
   }
 
   http.end();
@@ -230,146 +233,161 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
-  camera_fb_t *fb = NULL;
-  esp_err_t res = ESP_OK;
-  char part_buf[64];
+  camera_fb_t *fb  = NULL;
+  esp_err_t    res = ESP_OK;
+  char         hdr[128];
 
-  res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
+  res = httpd_resp_set_type(req,
+        "multipart/x-mixed-replace;boundary=" STREAM_BOUNDARY);
   if (res != ESP_OK) return res;
 
   while (true) {
     fb = esp_camera_fb_get();
     if (!fb) {
+      Serial.println("[ESP32] Stream: frame capture failed");
       res = ESP_FAIL;
     } else {
-      size_t hlen = snprintf(part_buf, 64,
-        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
-      res = httpd_resp_send_chunk(req, part_buf, hlen);
-      if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
-      if (res == ESP_OK) res = httpd_resp_send_chunk(req, "\r\n", 2);
+      size_t hlen = snprintf(hdr, sizeof(hdr), STREAM_PART, fb->len);
+      res = httpd_resp_send_chunk(req, hdr, hlen);
+      if (res == ESP_OK)
+        res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+      if (res == ESP_OK)
+        res = httpd_resp_send_chunk(req, "\r\n", 2);
       esp_camera_fb_return(fb);
     }
     if (res != ESP_OK) break;
-    delay(20);
+    delay(30);   // ~33 fps cap
   }
+
+  Serial.println("[ESP32] Stream ended");
   return res;
 }
 
-// =================== START SERVERS ===================
-
+// =====================================================
+//               START BOTH HTTP SERVERS
+// =====================================================
 void startCameraServer() {
-  // --- UI server on port 80 ---
-  httpd_config_t ui_config = HTTPD_DEFAULT_CONFIG();
-  ui_config.server_port = 80;
+  // --- UI server — port 80 ---
+  httpd_config_t ui_cfg  = HTTPD_DEFAULT_CONFIG();
+  ui_cfg.server_port     = 80;
+  ui_cfg.ctrl_port       = 32768;
 
-  httpd_uri_t index_uri   = { .uri = "/",       .method = HTTP_GET, .handler = index_handler,   .user_ctx = NULL };
-  httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL };
+  httpd_uri_t idx_uri = { "/",       HTTP_GET, index_handler,   NULL };
+  httpd_uri_t cap_uri = { "/capture",HTTP_GET, capture_handler, NULL };
 
-  if (httpd_start(&ui_httpd, &ui_config) == ESP_OK) {
-    httpd_register_uri_handler(ui_httpd, &index_uri);
-    httpd_register_uri_handler(ui_httpd, &capture_uri);
-    Serial.println("[ESP32] UI server started on port 80");
+  if (httpd_start(&ui_httpd, &ui_cfg) == ESP_OK) {
+    httpd_register_uri_handler(ui_httpd, &idx_uri);
+    httpd_register_uri_handler(ui_httpd, &cap_uri);
+    Serial.println("[ESP32] UI     server on port 80");
+  } else {
+    Serial.println("[ESP32] ERROR: UI server failed to start!");
   }
 
-  // --- Stream server on port 81 ---
-  httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
-  stream_config.server_port = 81;
-  stream_config.ctrl_port   = 32769;  // must differ from UI ctrl port
+  // --- Stream server — port 81 ---
+  httpd_config_t st_cfg  = HTTPD_DEFAULT_CONFIG();
+  st_cfg.server_port     = 81;
+  st_cfg.ctrl_port       = 32769;
 
-  httpd_uri_t stream_uri = { .uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL };
+  httpd_uri_t str_uri = { "/stream", HTTP_GET, stream_handler,  NULL };
 
-  if (httpd_start(&stream_httpd, &stream_config) == ESP_OK) {
-    httpd_register_uri_handler(stream_httpd, &stream_uri);
-    Serial.println("[ESP32] Stream server started on port 81");
+  if (httpd_start(&stream_httpd, &st_cfg) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &str_uri);
+    Serial.println("[ESP32] Stream server on port 81");
+  } else {
+    Serial.println("[ESP32] ERROR: Stream server failed to start!");
   }
 }
 
-// =================== SETUP ===================
+// =====================================================
+//                      SETUP
+// =====================================================
 void setup() {
-  delay(3000);
+  delay(2000);
   Serial.begin(115200);
-  delay(500);
+  delay(300);
+
   Serial.println("\n=============================");
   Serial.println("  ESP32-S3 Attendance Cam");
   Serial.println("  Freenove ESP32-S3-WROOM");
   Serial.println("=============================");
 
-  // --- Camera Config ---
-  camera_config_t config;
-  config.ledc_channel  = LEDC_CHANNEL_0;
-  config.ledc_timer    = LEDC_TIMER_0;
-  config.pin_d0        = Y2_GPIO_NUM;
-  config.pin_d1        = Y3_GPIO_NUM;
-  config.pin_d2        = Y4_GPIO_NUM;
-  config.pin_d3        = Y5_GPIO_NUM;
-  config.pin_d4        = Y6_GPIO_NUM;
-  config.pin_d5        = Y7_GPIO_NUM;
-  config.pin_d6        = Y8_GPIO_NUM;
-  config.pin_d7        = Y9_GPIO_NUM;
-  config.pin_xclk      = XCLK_GPIO_NUM;
-  config.pin_pclk      = PCLK_GPIO_NUM;
-  config.pin_vsync     = VSYNC_GPIO_NUM;
-  config.pin_href      = HREF_GPIO_NUM;
-  config.pin_sccb_sda  = SIOD_GPIO_NUM;
-  config.pin_sccb_scl  = SIOC_GPIO_NUM;
-  config.pin_pwdn      = PWDN_GPIO_NUM;
-  config.pin_reset     = RESET_GPIO_NUM;
-  config.xclk_freq_hz  = 20000000;
-  config.pixel_format  = PIXFORMAT_JPEG;
-  config.grab_mode     = CAMERA_GRAB_WHEN_EMPTY;
+  // ---------- Camera config ----------
+  camera_config_t cfg;
+  cfg.ledc_channel = LEDC_CHANNEL_0;
+  cfg.ledc_timer   = LEDC_TIMER_0;
+  cfg.pin_d0       = Y2_GPIO_NUM;
+  cfg.pin_d1       = Y3_GPIO_NUM;
+  cfg.pin_d2       = Y4_GPIO_NUM;
+  cfg.pin_d3       = Y5_GPIO_NUM;
+  cfg.pin_d4       = Y6_GPIO_NUM;
+  cfg.pin_d5       = Y7_GPIO_NUM;
+  cfg.pin_d6       = Y8_GPIO_NUM;
+  cfg.pin_d7       = Y9_GPIO_NUM;
+  cfg.pin_xclk     = XCLK_GPIO_NUM;
+  cfg.pin_pclk     = PCLK_GPIO_NUM;
+  cfg.pin_vsync    = VSYNC_GPIO_NUM;
+  cfg.pin_href     = HREF_GPIO_NUM;
+  cfg.pin_sccb_sda = SIOD_GPIO_NUM;
+  cfg.pin_sccb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn     = PWDN_GPIO_NUM;
+  cfg.pin_reset    = RESET_GPIO_NUM;
+  cfg.xclk_freq_hz = 20000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;   // always freshest frame
 
   if (psramFound()) {
-    Serial.println("[ESP32] PSRAM found - using maximum quality");
-    config.frame_size   = FRAMESIZE_UXGA;
-    config.jpeg_quality = 4;
-    config.fb_count     = 2;
-    config.fb_location  = CAMERA_FB_IN_PSRAM;
+    Serial.println("[ESP32] PSRAM found - max quality");
+    cfg.frame_size   = FRAMESIZE_UXGA;
+    cfg.jpeg_quality = 4;
+    cfg.fb_count     = 2;
+    cfg.fb_location  = CAMERA_FB_IN_PSRAM;
   } else {
-    Serial.println("[ESP32] No PSRAM - falling back to QVGA");
-    config.frame_size   = FRAMESIZE_QVGA;
-    config.jpeg_quality = 10;
-    config.fb_count     = 1;
-    config.fb_location  = CAMERA_FB_IN_DRAM;
+    Serial.println("[ESP32] No PSRAM - fallback QVGA");
+    cfg.frame_size   = FRAMESIZE_QVGA;
+    cfg.jpeg_quality = 10;
+    cfg.fb_count     = 1;
+    cfg.fb_location  = CAMERA_FB_IN_DRAM;
   }
 
-  // --- Init Camera ---
-  esp_err_t err = esp_camera_init(&config);
+  // ---------- Init camera ----------
+  esp_err_t err = esp_camera_init(&cfg);
   if (err != ESP_OK) {
     Serial.printf("[ESP32] ERROR: Camera init failed (0x%x)\n", err);
     return;
   }
-  Serial.println("[ESP32] Camera initialized successfully!");
+  Serial.println("[ESP32] Camera OK");
 
-  // --- Maximum Quality Sensor Settings ---
+  // ---------- Sensor tweaks ----------
   sensor_t *s = esp_camera_sensor_get();
-  s->set_framesize(s, FRAMESIZE_UXGA);
-  s->set_quality(s, 4);
-  s->set_brightness(s, 1);
-  s->set_contrast(s, 1);
-  s->set_saturation(s, 0);
-  s->set_whitebal(s, 1);
-  s->set_awb_gain(s, 1);
+  s->set_framesize    (s, FRAMESIZE_UXGA);
+  s->set_quality      (s, 4);
+  s->set_brightness   (s, 1);
+  s->set_contrast     (s, 1);
+  s->set_saturation   (s, 0);
+  s->set_whitebal     (s, 1);
+  s->set_awb_gain     (s, 1);
   s->set_exposure_ctrl(s, 1);
-  s->set_aec2(s, 1);
-  Serial.println("[ESP32] Camera quality set to MAXIMUM (UXGA, quality=4)");
+  s->set_aec2         (s, 1);
 
-  // --- WiFi Access Point ---
-  WiFi.softAP("ESP32-Camera", "12345678", 6);
+  // ---------- WiFi AP ----------
+  WiFi.softAP(WIFI_SSID, WIFI_PASS, 6);
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  Serial.print("[ESP32] WiFi AP started - IP: ");
-  Serial.println(WiFi.softAPIP());
+  Serial.printf("[ESP32] WiFi AP: %s | IP: %s\n",
+                WIFI_SSID, WiFi.softAPIP().toString().c_str());
 
-  // --- Start Web Servers ---
+  // ---------- HTTP servers ----------
   startCameraServer();
 
-  Serial.println("[ESP32] System ready!");
+  Serial.println("[ESP32] Ready!");
   Serial.println("[ESP32] Web UI : http://192.168.4.1");
   Serial.println("[ESP32] Stream : http://192.168.4.1:81/stream");
-  Serial.printf("[ESP32] Pi URL : %s\n", PI_SERVER_URL);
+  Serial.printf ("[ESP32] Pi URL : %s\n", PI_SERVER_URL);
   Serial.println("=============================");
 }
 
-// =================== LOOP ===================
+// =====================================================
+//                      LOOP
+// =====================================================
 void loop() {
   delay(1);
 }
