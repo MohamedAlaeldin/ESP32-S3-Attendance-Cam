@@ -25,9 +25,12 @@ const char* PI_SERVER_URL = "http://192.168.4.2:5000/upload";
 #define HREF_GPIO_NUM  7
 #define PCLK_GPIO_NUM  13
 
-httpd_handle_t camera_httpd = NULL;
+// Two separate HTTP server handles
+httpd_handle_t ui_httpd     = NULL;  // port 80  — web page + capture
+httpd_handle_t stream_httpd = NULL;  // port 81  — MJPEG stream
 
 // =================== WEB PAGE HTML ===================
+// Stream src points to port 81
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML>
 <html>
@@ -107,7 +110,7 @@ const char index_html[] PROGMEM = R"rawliteral(
   <h2>Attendance Cam</h2>
   <p class="subtitle">Freenove ESP32-S3-WROOM</p>
 
-  <img src="/stream" id="video">
+  <img src="http://192.168.4.1:81/stream" id="video">
 
   <p id="status">Ready</p>
 
@@ -240,10 +243,10 @@ static esp_err_t stream_handler(httpd_req_t *req) {
       res = ESP_FAIL;
     } else {
       size_t hlen = snprintf(part_buf, 64,
-        "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
       res = httpd_resp_send_chunk(req, part_buf, hlen);
       if (res == ESP_OK) res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
-      if (res == ESP_OK) res = httpd_resp_send_chunk(req, "\r\n--frame\r\n", 12);
+      if (res == ESP_OK) res = httpd_resp_send_chunk(req, "\r\n", 2);
       esp_camera_fb_return(fb);
     }
     if (res != ESP_OK) break;
@@ -252,19 +255,32 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   return res;
 }
 
+// =================== START SERVERS ===================
+
 void startCameraServer() {
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.server_port = 80;
+  // --- UI server on port 80 ---
+  httpd_config_t ui_config = HTTPD_DEFAULT_CONFIG();
+  ui_config.server_port = 80;
 
   httpd_uri_t index_uri   = { .uri = "/",       .method = HTTP_GET, .handler = index_handler,   .user_ctx = NULL };
-  httpd_uri_t stream_uri  = { .uri = "/stream",  .method = HTTP_GET, .handler = stream_handler,  .user_ctx = NULL };
   httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL };
 
-  if (httpd_start(&camera_httpd, &config) == ESP_OK) {
-    httpd_register_uri_handler(camera_httpd, &index_uri);
-    httpd_register_uri_handler(camera_httpd, &stream_uri);
-    httpd_register_uri_handler(camera_httpd, &capture_uri);
-    Serial.println("[ESP32] Web server started on port 80");
+  if (httpd_start(&ui_httpd, &ui_config) == ESP_OK) {
+    httpd_register_uri_handler(ui_httpd, &index_uri);
+    httpd_register_uri_handler(ui_httpd, &capture_uri);
+    Serial.println("[ESP32] UI server started on port 80");
+  }
+
+  // --- Stream server on port 81 ---
+  httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
+  stream_config.server_port = 81;
+  stream_config.ctrl_port   = 32769;  // must differ from UI ctrl port
+
+  httpd_uri_t stream_uri = { .uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL };
+
+  if (httpd_start(&stream_httpd, &stream_config) == ESP_OK) {
+    httpd_register_uri_handler(stream_httpd, &stream_uri);
+    Serial.println("[ESP32] Stream server started on port 81");
   }
 }
 
@@ -302,7 +318,6 @@ void setup() {
   config.pixel_format  = PIXFORMAT_JPEG;
   config.grab_mode     = CAMERA_GRAB_WHEN_EMPTY;
 
-  // Use PSRAM for maximum quality (Freenove ESP32-S3-WROOM has 8MB PSRAM)
   if (psramFound()) {
     Serial.println("[ESP32] PSRAM found - using maximum quality");
     config.frame_size   = FRAMESIZE_UXGA;
@@ -344,11 +359,13 @@ void setup() {
   Serial.print("[ESP32] WiFi AP started - IP: ");
   Serial.println(WiFi.softAPIP());
 
-  // --- Start Web Server ---
+  // --- Start Web Servers ---
   startCameraServer();
 
   Serial.println("[ESP32] System ready!");
-  Serial.printf("[ESP32] Pi server URL: %s\n", PI_SERVER_URL);
+  Serial.println("[ESP32] Web UI : http://192.168.4.1");
+  Serial.println("[ESP32] Stream : http://192.168.4.1:81/stream");
+  Serial.printf("[ESP32] Pi URL : %s\n", PI_SERVER_URL);
   Serial.println("=============================");
 }
 
